@@ -21,12 +21,11 @@ from utils.paths import auth_db_path, ensure_dir
 DB_PATH = auth_db_path()
 DEFAULT_ADMIN_USERNAME = "unsloth"
 
-# Single source for the password policy; models/auth.py ChangePasswordRequest
-# and the terminal prompt both enforce it. Keep the unsloth_cli mirror in sync.
+# Single source for the password policy; models/auth.py ChangePasswordRequest and the terminal
+# prompt both enforce it. Keep the unsloth_cli mirror in sync.
 MIN_PASSWORD_LENGTH = 8
 
-# Plaintext bootstrap password file beside auth.db, deleted on first password
-# change so the credential never lingers on disk.
+# Plaintext bootstrap password file, deleted on first password change.
 _BOOTSTRAP_PW_PATH = DB_PATH.parent / ".bootstrap_password"
 
 # In-process cache to avoid re-reading the file on every HTML serve.
@@ -34,19 +33,14 @@ _bootstrap_password: Optional[str] = None
 
 
 def _bootstrap_file_bytes(password: str) -> bytes:
-    """Exact on-disk form: the secret plus one LF.
-
-    Bytes, not text: text mode writes CRLF on Windows, and `$(cat ...)` strips
-    the LF but leaves the CR attached to the credential.
-    """
+    """Exact on-disk form: the secret plus one LF. Bytes, not text: text mode writes CRLF on Windows,
+    and `$(cat ...)` strips the LF but leaves the CR attached to the credential."""
     return (password + "\n").encode("utf-8")
 
 
 def _persist_bootstrap_password(password: str) -> None:
-    """Atomically write the bootstrap password 0600, LF terminated on every OS.
-
-    A partial write would destroy the only plaintext recovery credential.
-    """
+    """Atomically write the bootstrap password 0600, LF terminated on every OS: a partial write would
+    destroy the only plaintext recovery credential."""
     fd, tmp_name = tempfile.mkstemp(
         prefix = f".{_BOOTSTRAP_PW_PATH.name}.", dir = _BOOTSTRAP_PW_PATH.parent
     )
@@ -67,22 +61,16 @@ def _persist_bootstrap_password(password: str) -> None:
 
 
 def _normalise_bootstrap_file(raw: bytes, password: str) -> None:
-    """Append the LF a pre-newline release left off.
-
-    Append-only, and only when the file is exactly the credential:
-    clear_bootstrap_password() may unlink or (when unlink fails, notably on
-    Windows while this descriptor is open) truncate through another descriptor
-    after we read, so a rewrite could restore revoked plaintext. An append
-    cannot: worst case is a lone "\\n" over a cleared file, which strips back to
-    no bootstrap password. Pre-newline releases wrote no terminator at all, so
-    that is the only shape in the wild; anything else reads fine, since every
-    reader strips, and is left alone.
-    """
+    """Append the LF a pre-newline release left off. Append-only, and only when the file is exactly the
+    credential: clear_bootstrap_password() may unlink or (when unlink fails, notably on Windows
+    while this descriptor is open) truncate through another descriptor after we read, so a rewrite
+    could restore revoked plaintext. An append cannot: worst case is a lone terminator over a
+    cleared file, which strips back to no bootstrap password. Pre-newline releases wrote no
+    terminator at all, so that is the only shape in the wild."""
     if raw != password.encode("utf-8"):
         return
 
-    # O_BINARY: without it Windows opens in text mode and turns the LF straight
-    # back into CRLF, the bug being fixed.
+    # O_BINARY: Windows text mode turns the LF back into CRLF, the bug being fixed.
     fd = os.open(
         _BOOTSTRAP_PW_PATH,
         os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
@@ -103,9 +91,7 @@ def _read_persisted_bootstrap_password() -> Optional[str]:
     if not _BOOTSTRAP_PW_PATH.is_file():
         return None
 
-    # No caller handles a raise, so an unreadable file has to mean "no bootstrap
-    # password", not a dead backend. We write UTF-8, so undecodable bytes are
-    # damage whose plaintext is worthless anyway.
+    # An unreadable file must mean "no bootstrap password"; no caller handles a raise.
     try:
         raw = _BOOTSTRAP_PW_PATH.read_bytes()
         password = raw.decode("utf-8").strip()
@@ -114,8 +100,7 @@ def _read_persisted_bootstrap_password() -> Optional[str]:
     if not password:
         return None
 
-    # Older releases wrote no terminator; best-effort, a read-only auth dir must
-    # not fail startup.
+    # Older releases wrote no terminator; a read-only auth dir must not fail startup.
     if raw != _bootstrap_file_bytes(password):
         try:
             _normalise_bootstrap_file(raw, password)
@@ -125,24 +110,18 @@ def _read_persisted_bootstrap_password() -> Optional[str]:
 
 
 def generate_bootstrap_password() -> str:
-    """Generate a 4-word diceware passphrase and persist it to disk.
-
-    Persisted (the DB stores only the hash) so it survives restarts; later
-    calls return the persisted value.
-    """
+    """Generate a 4-word diceware passphrase and persist it to disk. Persisted (the DB stores only the
+    hash) so it survives restarts; later calls return it."""
     global _bootstrap_password
 
-    # Cached in this process?
     if _bootstrap_password is not None:
         return _bootstrap_password
 
-    # Persisted from a previous run?
     persisted = _read_persisted_bootstrap_password()
     if persisted:
         _bootstrap_password = persisted
         return _bootstrap_password
 
-    # First startup: generate a fresh passphrase.
     import diceware
 
     _bootstrap_password = diceware.get_passphrase(
@@ -157,38 +136,28 @@ def generate_bootstrap_password() -> str:
 
 
 def get_bootstrap_password() -> Optional[str]:
-    """Return the cached bootstrap password, or None if not yet generated."""
     return _bootstrap_password
 
 
 def _load_bootstrap_password() -> Optional[str]:
-    """Load an existing bootstrap password without creating one.
-
-    Upgrades take this path, not generate_bootstrap_password()
-    (ensure_default_admin short-circuits once the admin row exists), so it has
-    to normalise too.
-    """
+    """Load an existing bootstrap password without creating one. Upgrades take this path, not
+    generate_bootstrap_password() (ensure_default_admin short-circuits once the admin row exists),
+    so it has to normalise too."""
     global _bootstrap_password
     _bootstrap_password = _read_persisted_bootstrap_password()
     return _bootstrap_password
 
 
 def clear_bootstrap_password() -> None:
-    """Delete the persisted bootstrap password file (after a password change).
-
-    Best-effort: the new hash is already committed, so a locked/undeletable file
-    (Windows AV, read-only auth dir) must not fail the change.
-    """
+    """Delete the persisted bootstrap password file (after a password change). Best-effort: the new
+    hash is already committed, so a locked or undeletable file must not fail the change."""
     global _bootstrap_password
     _bootstrap_password = None
     if _BOOTSTRAP_PW_PATH.is_file():
         try:
             _BOOTSTRAP_PW_PATH.unlink(missing_ok = True)
         except OSError as e:
-            # Removal failed (Windows AV, read-only auth dir). The hash is already
-            # committed, so don't fail the change -- but truncate the file so its
-            # stale plaintext can't be re-seeded by generate_bootstrap_password()
-            # if auth.db is ever recreated.
+            # Truncate when removal fails: stale plaintext would otherwise be re-seeded if auth.db is recreated.
             try:
                 _BOOTSTRAP_PW_PATH.write_text("", encoding = "utf-8")
                 cleared = True
@@ -202,8 +171,7 @@ def clear_bootstrap_password() -> None:
                     "cleared its contents so the old bootstrap password cannot be reused."
                 )
             else:
-                # Neither removed nor truncated: stale plaintext is still on disk
-                # and would be reused if auth.db is reset. Don't claim otherwise.
+                # Stale plaintext is still on disk and would be reused if auth.db is reset.
                 message = (
                     f"Warning: could not delete or clear {_BOOTSTRAP_PW_PATH.name} ({e}); "
                     "its old bootstrap password is still on disk. Remove it manually to "
@@ -213,13 +181,10 @@ def clear_bootstrap_password() -> None:
 
 
 def _hash_token(token: str) -> str:
-    """SHA-256 hash helper for refresh token storage.
-
-    Plain SHA-256 is intentional: refresh tokens are 384-bit random strings, so
-    a slow KDF adds no security while costing per-refresh latency. API keys use
-    the separate ``_pbkdf2_api_key`` helper, only to satisfy CodeQL's
-    ``py/weak-sensitive-data-hashing`` query, not for crypto reasons.
-    """
+    """SHA-256 hash helper for refresh token storage. Plain SHA-256 is intentional: refresh tokens are
+    384-bit random strings, so a slow KDF adds no security while costing per-refresh latency. API
+    keys use the separate ``_pbkdf2_api_key`` helper, only to satisfy CodeQL's
+    ``py/weak-sensitive-data-hashing`` query."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
@@ -228,11 +193,9 @@ class CredentialRotated(Exception):
 
 
 def credential_generation(jwt_secret: str) -> str:
-    """Marker for the credential version a refresh token was issued under.
-
-    Every password change rotates ``jwt_secret``, so a token stamped with the
-    previous one is rejected even if it was inserted after the revoking DELETE.
-    """
+    """Marker for the credential version a refresh token was issued under. Every password change
+    rotates ``jwt_secret``, so a token stamped with the previous one is rejected even if it was
+    inserted after the revoking DELETE."""
     return hashlib.sha256(jwt_secret.encode("utf-8")).hexdigest()
 
 
@@ -269,24 +232,17 @@ def credential_generation_guard(username: str, expect_gen: Optional[str]) -> Ite
 
 
 def get_connection() -> sqlite3.Connection:
-    """Get a connection to the auth database, creating tables if needed."""
     ensure_dir(DB_PATH.parent)
     conn = sqlite3.connect(DB_PATH)
-    # Keep the auth dir + DB private (they hold the JWT/identity secrets and
-    # password hashes); sqlite3.connect would otherwise create the DB 0644 under
-    # a 022 umask, letting another OS user read the identity secret and forge proofs.
+    # sqlite3.connect would create the DB 0644 under a 022 umask, exposing identity secrets and password hashes.
     for _path, _mode in ((DB_PATH.parent, 0o700), (DB_PATH, 0o600)):
         try:
             os.chmod(_path, _mode)
         except OSError:
             pass
     conn.row_factory = sqlite3.Row
-    # WAL lets token reads run concurrently with refresh-token writes;
-    # busy_timeout bounds lock waits. Matches the other Unsloth SQLite stores.
-    # Set busy_timeout first: switching journal_mode needs a lock, so if a
-    # refresh-token write already holds one, journal_mode=WAL raises SQLITE_BUSY;
-    # with busy_timeout already in effect it waits instead of failing and leaving
-    # this connection on SQLite's default zero lock wait.
+    # Set busy_timeout before journal_mode=WAL: switching journal mode needs a lock and would otherwise
+    # raise SQLITE_BUSY.
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -357,22 +313,14 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+# No lock needed: INSERT OR IGNORE is atomic and concurrent populations converge on the same value.
 # ── API-key PBKDF2 salt ────────────────────────────────────────────────
-#
-# Module-level cache for the persistent API-key PBKDF2 salt, populated lazily
-# via ``_get_or_create_api_key_pbkdf2_salt``. No lock needed: (a) ``INSERT OR
-# IGNORE`` is atomic at the SQLite layer and (b) concurrent populations
-# converge on the same value, so the worst case is a harmless duplicate read
-# on startup.
 _api_key_pbkdf2_salt_cache: Optional[bytes] = None
 
 
 def _get_or_create_api_key_pbkdf2_salt() -> bytes:
-    """Return the persistent API-key PBKDF2 salt, generating it once if missing.
-
-    Hex-encoded 32-byte random value in ``app_secrets``. Regenerated only when
-    the row is missing (fresh install, or operator deleted it).
-    """
+    """Return the persistent API-key PBKDF2 salt, generating it once if missing. Hex-encoded 32-byte
+    random value in ``app_secrets``, regenerated only when the row is missing."""
     global _api_key_pbkdf2_salt_cache
     if _api_key_pbkdf2_salt_cache is not None:
         return _api_key_pbkdf2_salt_cache
@@ -385,7 +333,7 @@ def _get_or_create_api_key_pbkdf2_salt() -> bytes:
         )
         row = cur.fetchone()
         if row is None:
-            new_value = secrets.token_hex(32)  # 32 bytes -> 64 hex chars
+            new_value = secrets.token_hex(32)
             conn.execute(
                 "INSERT OR IGNORE INTO app_secrets (key, value) VALUES (?, ?)",
                 ("api_key_pbkdf2_salt", new_value),
@@ -404,9 +352,7 @@ def _get_or_create_api_key_pbkdf2_salt() -> bytes:
     return salt
 
 
-# Secret answering the /api/auth/identity challenge (HMAC(secret, nonce)). Lives
-# in this same-user DB so a port squatter or remote/fake server can't forge a
-# proof. Separate from the per-user JWT secret.
+# Identity-challenge secret lives in auth.db so a port squatter cannot forge a proof; separate from the JWT secret.
 _IDENTITY_SECRET_DB_KEY = "studio_identity_secret"
 _identity_secret_cache: Optional[bytes] = None
 
@@ -441,9 +387,8 @@ def get_or_create_identity_secret() -> bytes:
     return secret
 
 
-# Dedicated AES-256 key used to encrypt Studio credentials in studio.db.
-# It intentionally lives in auth.db so copying studio.db alone does not expose
-# provider or Hugging Face tokens, and survives password changes/resets.
+# Dedicated AES-256 key: lives in auth.db so copying studio.db alone does not expose provider/HF
+# tokens, and survives password resets.
 _CREDENTIAL_ENCRYPTION_KEY_DB_KEY = "credential_encryption_key_v1"
 _credential_encryption_key_cache: Optional[bytes] = None
 
@@ -481,23 +426,19 @@ def get_or_create_credential_encryption_key() -> bytes:
 
 
 def compute_identity_proof(nonce: bytes, host: str, port: int) -> str:
-    """HMAC-SHA256 proof that the caller holds this install's identity secret,
-    bound to the loopback address and port the connection landed on. A proof
-    relayed from an Unsloth on a different address/port (a squatter proxying to the
-    real one, e.g. localhost resolving to ::1 while Unsloth is on 127.0.0.1) was
-    computed for that other endpoint and won't match the one the client dialed."""
+    """HMAC-SHA256 proof that the caller holds this install's identity secret, bound to the loopback
+    address and port the connection landed on. A proof relayed from an Unsloth on a different
+    address or port was computed for that other endpoint and will not match the one the client
+    dialed."""
     try:
-        host = ipaddress.ip_address(host).compressed  # normalise 127.0.0.1 / ::1 forms
+        host = ipaddress.ip_address(host).compressed
     except ValueError:
         host = (host or "").lower()
     msg = b"|".join([nonce, host.encode(), str(int(port)).encode()])
     return hmac.new(get_or_create_identity_secret(), msg, hashlib.sha256).hexdigest()
 
 
-# Capability secret for public ``/p`` preview share links. HMAC(secret, ref)
-# turns the deterministic preview ref into an unguessable bearer capability, so a
-# guessed run/checkpoint name can't reach inference. Dedicated (not the per-user
-# JWT secret) so rotating it revokes every shared link without touching logins.
+# Dedicated secret so rotating it revokes every shared preview link without touching logins.
 _PREVIEW_LINK_SECRET_DB_KEY = "preview_link_secret"
 _preview_link_secret_cache: Optional[bytes] = None
 
@@ -558,13 +499,10 @@ _DESKTOP_SECRET_CREATED_AT_KEY = "desktop_secret_created_at"
 
 
 def _pbkdf2_api_key(raw_key: str) -> str:
-    """PBKDF2-HMAC-SHA256 an API key with a persistent server-side salt.
-
-    For API-key storage ONLY, not refresh tokens. The slow KDF is only to
-    appease CodeQL's ``py/weak-sensitive-data-hashing`` query, not a crypto
-    requirement (API keys are random 128-bit tokens). The salt lives in
-    ``app_secrets`` so dumping ``api_keys`` alone can't derive hashes.
-    """
+    """PBKDF2-HMAC-SHA256 an API key with a persistent server-side salt. For API-key storage ONLY, not
+    refresh tokens: the slow KDF is only to appease CodeQL's ``py/weak-sensitive-data-hashing``
+    query, since API keys are random 128-bit tokens. The salt lives in ``app_secrets`` so dumping
+    ``api_keys`` alone cannot derive hashes."""
     salt = _get_or_create_api_key_pbkdf2_salt()
     dk = hashlib.pbkdf2_hmac(
         "sha256",
@@ -579,11 +517,8 @@ def _pbkdf2_desktop_secret(raw_secret: str) -> str:
     return _pbkdf2_api_key(raw_secret)
 
 
-# Memoize the deterministic raw-key -> PBKDF2-hash derivation so the 100k-round
-# KDF runs once per key instead of on every authenticated request. Keyed by a
-# salted HMAC of the key (not the key itself); revocation/expiry are still
-# enforced by the SQLite read on every call, so a cache hit only skips the KDF.
-# Only keys present in the DB are cached, so unknown-key spam can't grow it.
+# Keyed by a salted HMAC, not the key; revocation/expiry are still enforced by the SQLite read, and
+# only known keys are cached.
 _api_key_hash_cache: dict[str, str] = {}
 # Whether each memoized key was minted internally; set once, since minting decides it.
 _api_key_internal_cache: dict[str, bool] = {}
@@ -599,14 +534,12 @@ def _api_key_cache_id(raw_key: str) -> str:
 
 
 def _reset_api_key_hash_cache() -> None:
-    """Drop memoized derivations (tests / salt change)."""
     with _api_key_hash_cache_lock:
         _api_key_hash_cache.clear()
         _api_key_internal_cache.clear()
 
 
 def is_initialized() -> bool:
-    """Check if auth is ready for login (at least one user exists in DB)."""
     conn = get_connection()
     cur = conn.execute("SELECT COUNT(*) AS c FROM auth_user")
     row = cur.fetchone()
@@ -621,11 +554,8 @@ def create_initial_user(
     *,
     must_change_password: bool = False,
 ) -> None:
-    """
-    Create the initial admin user in the database.
-
-    Raises sqlite3.IntegrityError if username already exists.
-    """
+    """Create the initial admin user in the database. Raises sqlite3.IntegrityError if username already
+    exists."""
     from .hashing import hash_password
 
     salt, pwd_hash = hash_password(password)
@@ -650,11 +580,8 @@ def create_initial_user(
 
 
 def delete_user(username: str) -> None:
-    """
-    Delete a user from the database.
-
-    Used for rollback when user creation fails partway through bootstrap.
-    """
+    """Delete a user from the database, for rollback when user creation fails partway through
+    bootstrap."""
     conn = get_connection()
     try:
         conn.execute("DELETE FROM auth_user WHERE username = ?", (username,))
@@ -664,12 +591,8 @@ def delete_user(username: str) -> None:
 
 
 def get_user_and_secret(username: str) -> Optional[Tuple[str, str, str, bool]]:
-    """
-    Get user's password salt, hash, and JWT secret.
-
-    Returns (password_salt, password_hash, jwt_secret, must_change_password)
-    or None if user not found.
-    """
+    """Get user's password salt, hash, and JWT secret. Returns (password_salt, password_hash,
+    jwt_secret, must_change_password) or None."""
     conn = get_connection()
     try:
         cur = conn.execute(
@@ -694,7 +617,6 @@ def get_user_and_secret(username: str) -> Optional[Tuple[str, str, str, bool]]:
 
 
 def get_jwt_secret(username: str) -> Optional[str]:
-    """Return the current JWT signing secret for a user."""
     conn = get_connection()
     try:
         cur = conn.execute(
@@ -708,7 +630,6 @@ def get_jwt_secret(username: str) -> Optional[str]:
 
 
 def requires_password_change(username: str) -> bool:
-    """Return whether the user must change the seeded default password."""
     conn = get_connection()
     try:
         cur = conn.execute(
@@ -722,11 +643,7 @@ def requires_password_change(username: str) -> bool:
 
 
 def load_jwt_secret() -> str:
-    """
-    Load the JWT secret from the database.
-
-    Raises RuntimeError if no auth user has been created yet.
-    """
+    """Load the JWT secret from the database. Raises RuntimeError if no auth user has been created yet."""
     conn = get_connection()
     try:
         cur = conn.execute("SELECT jwt_secret FROM auth_user LIMIT 1")
@@ -741,11 +658,8 @@ def load_jwt_secret() -> str:
 
 
 def ensure_default_admin() -> bool:
-    """Seed the default admin account on first startup.
-
-    Uses a randomly generated diceware passphrase as the bootstrap password.
-    Returns True when the default admin was created in this call.
-    """
+    """Seed the default admin account on first startup, using a randomly generated diceware passphrase
+    as the bootstrap password. Returns True when it was created in this call."""
     if get_user_and_secret(DEFAULT_ADMIN_USERNAME) is not None:
         _load_bootstrap_password()
         return False
@@ -771,26 +685,15 @@ def update_password(
     expect_password_hash: Optional[str] = None,
     preserve_desktop_secret: bool = False,
 ) -> Optional[str]:
-    """Update password, clear first-login requirement, rotate JWT secret.
-
-    Returns the new JWT secret, or None when nothing was updated. Callers that
-    mint tokens for the caller must sign with the returned secret: re-reading it
-    would pick up a reset that landed between this commit and the mint.
-
-    ``revoke_refresh_tokens`` deletes the user's refresh tokens in the SAME
-    transaction: a separate delete could fail after the password commit and
-    leave a pre-change token still able to mint access tokens.
-
-    ``expect_password_hash`` makes the write conditional on the credential the
-    caller verified still being current, so a request that checked the old
-    password cannot overwrite a reset that landed while it was in flight.
-    Returns False when the credential moved underneath it.
-
-    ``preserve_desktop_secret`` keeps the local desktop credential valid. It is
-    for a caller that already authenticated as the desktop app: revoking the
-    secret it is currently using would break desktop auto-auth for a change the
-    desktop itself made.
-    """
+    """Update password, clear first-login requirement, rotate JWT secret. Returns the new JWT secret,
+    or None when nothing was updated. Callers that mint tokens must sign with the returned secret:
+    re-reading it would pick up a reset that landed between this commit and the mint.
+    ``revoke_refresh_tokens`` deletes the user's refresh tokens in the SAME transaction, since a
+    separate delete could fail after the password commit and leave a pre-change token able to mint
+    access tokens. ``expect_password_hash`` makes the write conditional on the credential the caller
+    verified still being current, returning False when it moved underneath.
+    ``preserve_desktop_secret`` keeps the local desktop credential valid, for a caller that already
+    authenticated as the desktop app and would otherwise break its own auto-auth."""
     from .hashing import hash_password
 
     salt, pwd_hash = hash_password(new_password)
@@ -836,13 +739,9 @@ def save_refresh_token(
     is_desktop: bool = False,
     secret_gen: Optional[str] = None,
 ) -> None:
-    """
-    Store a hashed refresh token with its associated username and expiry.
-
-    ``secret_gen`` binds the token to a credential version; it defaults to the
-    current one, and callers that already verified a credential must pass the
-    version they verified rather than let this re-read a rotated one.
-    """
+    """Store a hashed refresh token with its associated username and expiry. ``secret_gen`` binds the
+    token to a credential version; it defaults to the current one, and callers that already verified
+    a credential must pass the version they verified."""
     token_hash = _hash_token(token)
     conn = get_connection()
     try:
@@ -861,21 +760,17 @@ def save_refresh_token(
 
 
 def consume_refresh_token(token: str) -> Optional[Tuple[str, bool, str]]:
-    """Atomically validate-and-delete a refresh token for single-use rotation.
-
-    DELETE RETURNING fuses validate and delete into one statement so two
-    concurrent refresh requests cannot both consume the same token. Returns
-    ``(username, is_desktop, jwt_secret)``; the caller must mint the replacement
-    tokens against that secret so a rotation landing mid-refresh cannot issue a
-    post-rotation session from a pre-rotation token.
-    """
+    """Atomically validate-and-delete a refresh token for single-use rotation. DELETE RETURNING fuses
+    validate and delete into one statement so two concurrent refresh requests cannot both consume
+    the same token. Returns ``(username, is_desktop, jwt_secret)``; the caller must mint the
+    replacement tokens against that secret so a rotation landing mid-refresh cannot issue a
+    post-rotation session from a pre-rotation token."""
     token_hash = _hash_token(token)
     now = datetime.now(timezone.utc).isoformat()
     conn = get_connection()
     try:
-        # One transaction with the delete: an unstamped legacy row has no
-        # generation to compare, so reading the credential after committing would
-        # hand a reset's new secret to a token issued before it.
+        # One transaction with the delete: an unstamped legacy row has no generation, so a later read could
+        # hand a reset's new secret to an older token.
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "DELETE FROM refresh_tokens WHERE expires_at < ?",
@@ -905,16 +800,11 @@ def consume_refresh_token(token: str) -> Optional[Tuple[str, bool, str]]:
 
 
 def verify_refresh_token(token: str) -> Optional[Tuple[str, bool]]:
-    """
-    Verify a refresh token and return the username plus desktop marker.
-
-    Returns the username and desktop marker if valid and not expired, None otherwise.
-    The token is NOT consumed — it stays valid until it expires.
-    """
+    """Verify a refresh token and return the username plus desktop marker, or None when invalid or
+    expired. The token is NOT consumed: it stays valid until it expires."""
     token_hash = _hash_token(token)
     conn = get_connection()
     try:
-        # Opportunistically clean up expired tokens
         conn.execute(
             "DELETE FROM refresh_tokens WHERE expires_at < ?",
             (datetime.now(timezone.utc).isoformat(),),
@@ -939,7 +829,6 @@ def verify_refresh_token(token: str) -> Optional[Tuple[str, bool]]:
             conn.commit()
             return None
 
-        # Check expiry
         expires_at = datetime.fromisoformat(row["expires_at"])
         if datetime.now(timezone.utc) > expires_at:
             conn.execute("DELETE FROM refresh_tokens WHERE id = ?", (row["id"],))
@@ -952,7 +841,6 @@ def verify_refresh_token(token: str) -> Optional[Tuple[str, bool]]:
 
 
 def revoke_user_refresh_tokens(username: str) -> None:
-    """Revoke all refresh tokens for a user (e.g. on logout)."""
     conn = get_connection()
     try:
         conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (username,))
@@ -984,12 +872,10 @@ def create_desktop_secret() -> str:
 
 
 def validate_desktop_secret_with_credential(raw_secret: str) -> Optional[Tuple[str, str]]:
-    """Validate the desktop secret and return ``(username, jwt_secret)``.
-
-    Both reads share one transaction so the returned secret is the credential
-    version the desktop secret was checked against; a reset landing mid-request
-    then invalidates the tokens minted from it rather than blessing them.
-    """
+    """Validate the desktop secret and return ``(username, jwt_secret)``. Both reads share one
+    transaction so the returned secret is the credential version the desktop secret was checked
+    against; a reset landing mid-request then invalidates the tokens minted from it rather than
+    blessing them."""
     if not raw_secret.startswith(DESKTOP_SECRET_PREFIX):
         return None
 
@@ -1013,13 +899,11 @@ def validate_desktop_secret_with_credential(raw_secret: str) -> Optional[Tuple[s
 
 
 def validate_desktop_secret(raw_secret: str) -> Optional[str]:
-    """Return the real admin username when the desktop secret matches."""
     verified = validate_desktop_secret_with_credential(raw_secret)
     return verified[0] if verified else None
 
 
 def clear_desktop_secret() -> None:
-    """Remove backend-side desktop auth state."""
     conn = get_connection()
     try:
         conn.execute(
@@ -1031,19 +915,10 @@ def clear_desktop_secret() -> None:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# API key management
-# ---------------------------------------------------------------------------
-
 API_KEY_PREFIX = "sk-unsloth-"
 
-# The ``name`` a workflow mints its internal key under. Studio mints internal
-# keys for more than one workflow and they do not carry the same authority, so
-# the name is the only thing that tells them apart after the fact. Deep Research
-# is durable: its hops outlive the session that started them, so they carry a key
-# instead of a JWT and still have to reach the saved connection the run was
-# created with. A data-recipe key is handed to a user-authored recipe subprocess
-# and needs nothing but this host's local /v1, so it must never gain that reach.
+# The name is the only thing distinguishing internal keys by authority: Deep Research keys must
+# reach the saved connection, data-recipe keys only local /v1.
 DEEP_RESEARCH_WORKFLOW_KEY_NAME = "deep-research workflow"
 
 
@@ -1054,18 +929,12 @@ def create_api_key(
     internal: bool = False,
     expect_gen: Optional[str] = None,
 ) -> Tuple[str, dict]:
-    """Create a new API key for *username*.
-
-    Returns ``(raw_key, row_dict)`` where *raw_key* is shown to the user
-    exactly once.  The database only stores the PBKDF2 hash.
-
-    Pass ``internal=True`` for keys minted by workflows (e.g. data-recipe
-    runs) that should not appear in user-facing key listings.
-
-    ``expect_gen`` ties the insert to the credential generation the request
-    authenticated under, so a session revoked by a concurrent password reset
-    cannot mint a key that outlives it. Raises ``CredentialRotated`` if it moved.
-    """
+    """Create a new API key for *username*. Returns ``(raw_key, row_dict)`` where *raw_key* is shown to
+    the user exactly once; the database only stores the PBKDF2 hash. Pass ``internal=True`` for keys
+    minted by workflows that should not appear in user-facing listings. ``expect_gen`` ties the
+    insert to the credential generation the request authenticated under, so a session revoked by a
+    concurrent password reset cannot mint a key that outlives it. Raises ``CredentialRotated`` if it
+    moved."""
     raw_key = API_KEY_PREFIX + secrets.token_hex(16)
     key_hash = _pbkdf2_api_key(raw_key)
     key_prefix = raw_key[len(API_KEY_PREFIX) : len(API_KEY_PREFIX) + 8]
@@ -1149,11 +1018,8 @@ def revoke_api_key(username: str, key_id: int) -> bool:
 
 
 def revoke_internal_api_key(key_id: int) -> bool:
-    """Revoke an internal workflow-minted key without requiring a username.
-
-    Used by the recipe runner to retire its sk-unsloth-* key once the job
-    terminates, shrinking the window a leaked key could be abused.
-    """
+    """Revoke an internal workflow-minted key without requiring a username. Used by the recipe runner
+    to retire its key once the job terminates, shrinking the window a leaked key could be abused."""
     conn = get_connection()
     try:
         cursor = conn.execute(
@@ -1167,12 +1033,10 @@ def revoke_internal_api_key(key_id: int) -> bool:
 
 
 def is_internal_api_key(raw_key: str) -> bool:
-    """Whether *raw_key* is a workflow-minted internal key rather than a user's own.
-
-    Lets request-scoped code (the API monitor) tell Studio's own background work from a
-    third party using Unsloth as an API server. The answer is memoized because this runs on
-    the event loop for every API-key request and a key's origin is fixed when it is minted.
-    """
+    """Whether *raw_key* is a workflow-minted internal key rather than a user's own. Lets
+    request-scoped code tell Unsloth's own background work from a third party using Unsloth as an
+    API server. Memoized, because this runs on the event loop for every API-key request and a key's
+    origin is fixed when it is minted."""
     if not raw_key.startswith(API_KEY_PREFIX):
         return False
     cache_id = _api_key_cache_id(raw_key)
@@ -1202,19 +1066,13 @@ def is_internal_api_key(raw_key: str) -> bool:
 
 def internal_api_key_name(raw_key: str) -> Optional[str]:
     """The workflow name *raw_key* was minted under, or ``None`` if it is not internal.
-
-    ``is_internal_api_key`` answers "is this Studio's own key", which is the right
-    question for a monitor label but far too coarse for authorization: a
-    data-recipe key runs inside a recipe the user authored, so treating it as
-    equal to the Deep Research hop would let that recipe spend any saved cloud
-    credential. The name is fixed when the key is minted and is the only durable
-    thing that separates the two.
-
-    Deliberately not memoized: this is read on the external-provider path only,
-    once per request that carries an API key, and a stale answer here would be a
-    stale authorization. The PBKDF2 derivation is taken from the shared hash
-    cache when it is warm, so the cost is one indexed lookup.
-    """
+    ``is_internal_api_key`` answers "is this Unsloth's own key", which is far too coarse for
+    authorization: a data-recipe key runs inside a recipe the user authored, so treating it as equal
+    to the Deep Research hop would let that recipe spend any saved cloud credential. The name is
+    fixed when the key is minted and is the only durable thing separating the two. Deliberately not
+    memoized: this is read on the external-provider path once per request, and a stale answer would
+    be a stale authorization. The PBKDF2 derivation comes from the shared hash cache when it is
+    warm."""
     if not raw_key.startswith(API_KEY_PREFIX):
         return None
     cache_id = _api_key_cache_id(raw_key)
@@ -1235,25 +1093,26 @@ def internal_api_key_name(raw_key: str) -> Optional[str]:
 
 
 def validate_api_key(raw_key: str) -> Optional[str]:
-    """Validate *raw_key* and return the owning username, or ``None``."""
     verified = validate_api_key_with_credential(raw_key)
     return verified[0] if verified else None
 
 
-def validate_api_key_with_credential(raw_key: str) -> Optional[Tuple[str, str]]:
-    """Validate *raw_key* and return ``(username, jwt_secret)``, or ``None``.
-
-    Also updates ``last_used_at`` on success. The key check and the credential
-    read share one write transaction, so the returned version is the one the key
-    was actually valid under: a reset committing right after cannot have its new
-    generation handed to a request the key it revoked authenticated.
-    """
+def validate_api_key_with_credential(
+    raw_key: str, *, touch: bool = True
+) -> Optional[Tuple[str, str]]:
+    """Validate *raw_key* and return ``(username, jwt_secret)``, or ``None``. Also updates
+    ``last_used_at`` on success. The key check and the credential read share one write transaction,
+    so the returned version is the one the key was actually valid under. ``touch=False`` drops that
+    stamp, and with it the write transaction, for a caller that only asks whether the key
+    authenticates: one request must not count as two uses, and on sqlite the write lock is global,
+    so an advisory check has no business taking it."""
     cache_id = _api_key_cache_id(raw_key)
     cached_hash = _api_key_hash_cache.get(cache_id)
     key_hash = cached_hash if cached_hash is not None else _pbkdf2_api_key(raw_key)
     conn = get_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if touch:
+            conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "SELECT id, username, is_active, expires_at FROM api_keys WHERE key_hash = ?",
             (key_hash,),
@@ -1266,9 +1125,8 @@ def validate_api_key_with_credential(raw_key: str) -> Optional[Tuple[str, str]]:
             with _api_key_hash_cache_lock:
                 if len(_api_key_hash_cache) >= _API_KEY_HASH_CACHE_MAX:
                     _api_key_hash_cache.clear()
-                    # is_internal_api_key sizes itself against the hash cache, so clearing one
-                    # without the other lets the origin cache grow past the bound. Deep Research
-                    # mints a fresh internal key per model call, so that adds up.
+                    # Clear both caches together: the origin cache is sized against the hash cache and would otherwise
+                    # grow past its bound.
                     _api_key_internal_cache.clear()
                 _api_key_hash_cache[cache_id] = key_hash
         if not row["is_active"]:
@@ -1280,11 +1138,12 @@ def validate_api_key_with_credential(raw_key: str) -> Optional[Tuple[str, str]]:
         secret = _current_secret(conn, row["username"])
         if secret is None:
             return None
-        conn.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
-            (datetime.now(timezone.utc).isoformat(), row["id"]),
-        )
-        conn.commit()
+        if touch:
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), row["id"]),
+            )
+            conn.commit()
         return row["username"], secret
     finally:
         conn.rollback()
