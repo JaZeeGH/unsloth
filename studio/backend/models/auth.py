@@ -41,6 +41,13 @@ class AuthStatusResponse(BaseModel):
         ...,
         description = "True if the seeded admin must still change the default password",
     )
+    bootstrap_deadline_seconds: Optional[int] = Field(
+        None,
+        description = (
+            "Seconds until this instance shuts down for leaving the default password "
+            "unchanged, or null when the launch is not time-boxed."
+        ),
+    )
 
 
 class DesktopInitialPasswordRequest(BaseModel):
@@ -66,11 +73,6 @@ class ChangePasswordRequest(BaseModel):
         min_length = MIN_PASSWORD_LENGTH,
         description = f"Replacement password (minimum {MIN_PASSWORD_LENGTH} characters)",
     )
-
-
-# ---------------------------------------------------------------------------
-# API key schemas
-# ---------------------------------------------------------------------------
 
 
 class CreateApiKeyRequest(BaseModel):

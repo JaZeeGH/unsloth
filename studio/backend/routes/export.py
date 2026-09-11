@@ -20,7 +20,8 @@ backend_path = Path(__file__).parent.parent.parent
 if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
-from auth.authentication import get_current_subject
+from auth.authentication import allow_ambient_hf_token, get_current_subject
+from hub.utils.hf_tokens import HfTokenArg, hf_token_arg
 
 from utils.utils import safe_error_detail
 
@@ -47,13 +48,11 @@ logger = get_logger(__name__)
 
 
 async def _ensure_export_supported() -> None:
-    """Reject a mutating export request up front (HTTP 400) when the host can't export.
-
-    Keeps the backend authoritative even if a client bypasses the UI gate. Read-only endpoints
+    """Reject a mutating export request up front (HTTP 400) when the host can't export. Keeps the
+    backend authoritative even if a client bypasses the UI gate. Read-only endpoints
     (scan/status/logs) are intentionally NOT gated so the Export page can still render the reason.
-    Also refuses (409) while a latest-transformers install is swapping .venv_t5_latest: an
-    export worker spawned mid-swap could activate a half-replaced sidecar.
-    """
+    Also refuses (409) while a latest-transformers install is swapping .venv_t5_latest: an export
+    worker spawned mid-swap could activate a half-replaced sidecar."""
     from utils.transformers_latest import is_install_in_progress
 
     if is_install_in_progress():
@@ -74,9 +73,29 @@ async def _ensure_export_supported() -> None:
         )
 
 
+def _resolve_export_hf_token(
+    raw_token: Optional[str],
+    *,
+    push_to_hub: bool = False,
+    allow_ambient: bool = True,
+) -> HfTokenArg:
+    """The credential this export runs under, as the anonymous-aware sentinel. ``None`` reads
+    downstream as "go and find a credential" (``if token is None: get_token()``), so a caller denied
+    the ambient token is spelled ``False``."""
+    token = raw_token.strip() if isinstance(raw_token, str) and raw_token.strip() else None
+    if push_to_hub and token is None and not allow_ambient:
+        raise HTTPException(
+            status_code = 400,
+            detail = "Hugging Face token is required to push to Hub when authenticated via API key.",
+        )
+    return hf_token_arg(token, allow_ambient_token = allow_ambient)
+
+
 @router.post("/load-checkpoint", response_model = ExportOperationResponse)
 async def load_checkpoint(
-    request: LoadCheckpointRequest, current_subject: str = Depends(get_current_subject)
+    request: LoadCheckpointRequest,
+    current_subject: str = Depends(get_current_subject),
+    allow_ambient: bool = Depends(allow_ambient_hf_token),
 ):
     """Load a checkpoint into the export backend (ExportBackend.load_checkpoint).
 
@@ -97,7 +116,9 @@ async def load_checkpoint(
             load_in_4bit = request.load_in_4bit,
             trust_remote_code = request.trust_remote_code,
             approved_remote_code_fingerprint = request.approved_remote_code_fingerprint,
-            hf_token = request.hf_token,
+            hf_token = _resolve_export_hf_token(request.hf_token, allow_ambient = allow_ambient),
+            # A supplied token cannot say whether it came from a session or an API key.
+            allow_ambient = allow_ambient,
             subject = current_subject,
         )
 
@@ -213,20 +234,18 @@ async def get_export_logs(
 
     The SSE endpoint (`/logs/stream`) is the low-latency path, but some reverse
     proxies -- notably Cloudflare quick tunnels (`*.trycloudflare.com`) used by
-    `--secure` mode -- buffer `text/event-stream` responses and only flush when
-    the stream closes, so over the tunnel the browser sees nothing for the whole
-    export ("connecting..." with no logs). This endpoint returns the same
-    ring-buffer lines as a short, complete JSON response that no proxy buffers,
-    so the frontend can poll it and still show logs in near real time.
+    `--secure` mode -- buffer streamed GET responses until the stream closes.
+    This endpoint returns the same ring-buffer lines as a short, complete JSON
+    response that no proxy buffers, so the frontend can poll it and still show
+    logs in near real time even where the stream itself does not arrive.
 
     Shares the orchestrator's monotonic `seq` cursor with the SSE stream, so the
     two transports can run together and the client de-dupes by seq.
     """
     try:
         backend = get_export_backend()
-        # No cursor on the first poll of a run: start from the run-start snapshot
-        # so the client gets every line since the run began (matches the SSE
-        # default), not the entire historical ring buffer.
+        # No cursor on the first poll of a run: start from the run-start snapshot so the client gets every line since
+        # the run began (matches the SSE default), not the entire historical ring buffer.
         if since is None:
             cursor = backend.get_run_start_seq()
         else:
@@ -282,8 +301,7 @@ def _export_details(
         from utils.paths.storage_roots import exports_root
 
         path = Path(output_path)
-        # If it's outside exports_root, return the full absolute path
-        # so users can find their files on a different drive.
+        # Outside exports_root, so return the full absolute path and users can find their files on another drive.
         if path.is_absolute():
             try:
                 path.resolve().relative_to(exports_root().resolve())
@@ -304,7 +322,9 @@ def _export_details(
 
 @router.post("/export/merged", response_model = ExportOperationResponse)
 async def export_merged_model(
-    request: ExportMergedModelRequest, current_subject: str = Depends(get_current_subject)
+    request: ExportMergedModelRequest,
+    current_subject: str = Depends(get_current_subject),
+    allow_ambient: bool = Depends(allow_ambient_hf_token),
 ):
     """Export a merged PEFT model (16-bit or 4-bit), optionally pushing to Hub.
 
@@ -319,7 +339,11 @@ async def export_merged_model(
             format_type = request.format_type,
             push_to_hub = request.push_to_hub,
             repo_id = request.repo_id,
-            hf_token = request.hf_token,
+            hf_token = _resolve_export_hf_token(
+                request.hf_token,
+                push_to_hub = request.push_to_hub,
+                allow_ambient = allow_ambient,
+            ),
             private = request.private,
             compressed_method = request.compressed_method,
         )
@@ -338,7 +362,6 @@ async def export_merged_model(
         from utils.transformers_version import SidecarSwapInProgress
 
         if isinstance(e, SidecarSwapInProgress):
-            # Expected loss of the race against a sidecar install: retryable 409.
             raise HTTPException(status_code = 409, detail = str(e))
         logger.error(f"Error exporting merged model: {e}", exc_info = True)
         raise HTTPException(
@@ -349,7 +372,9 @@ async def export_merged_model(
 
 @router.post("/export/base", response_model = ExportOperationResponse)
 async def export_base_model(
-    request: ExportBaseModelRequest, current_subject: str = Depends(get_current_subject)
+    request: ExportBaseModelRequest,
+    current_subject: str = Depends(get_current_subject),
+    allow_ambient: bool = Depends(allow_ambient_hf_token),
 ):
     """Export a non-PEFT base model, optionally pushing to Hub.
 
@@ -363,7 +388,11 @@ async def export_base_model(
             save_directory = request.save_directory,
             push_to_hub = request.push_to_hub,
             repo_id = request.repo_id,
-            hf_token = request.hf_token,
+            hf_token = _resolve_export_hf_token(
+                request.hf_token,
+                push_to_hub = request.push_to_hub,
+                allow_ambient = allow_ambient,
+            ),
             private = request.private,
             base_model_id = request.base_model_id,
         )
@@ -382,7 +411,6 @@ async def export_base_model(
         from utils.transformers_version import SidecarSwapInProgress
 
         if isinstance(e, SidecarSwapInProgress):
-            # Expected loss of the race against a sidecar install: retryable 409.
             raise HTTPException(status_code = 409, detail = str(e))
         logger.error(f"Error exporting base model: {e}", exc_info = True)
         raise HTTPException(
@@ -393,7 +421,9 @@ async def export_base_model(
 
 @router.post("/export/gguf", response_model = ExportOperationResponse)
 async def export_gguf(
-    request: ExportGGUFRequest, current_subject: str = Depends(get_current_subject)
+    request: ExportGGUFRequest,
+    current_subject: str = Depends(get_current_subject),
+    allow_ambient: bool = Depends(allow_ambient_hf_token),
 ):
     """Export the current model to GGUF format, optionally pushing to Hub.
 
@@ -410,8 +440,14 @@ async def export_gguf(
             quantization_method = request.quantization_method,
             push_to_hub = request.push_to_hub,
             repo_id = request.repo_id,
-            hf_token = request.hf_token,
+            hf_token = _resolve_export_hf_token(
+                request.hf_token,
+                push_to_hub = request.push_to_hub,
+                allow_ambient = allow_ambient,
+            ),
             imatrix_file = imatrix_file,
+            private = request.private,
+            gguf_shard_size = request.gguf_shard_size,
         )
 
         if not success:
@@ -428,7 +464,6 @@ async def export_gguf(
         from utils.transformers_version import SidecarSwapInProgress
 
         if isinstance(e, SidecarSwapInProgress):
-            # Expected loss of the race against a sidecar install: retryable 409.
             raise HTTPException(status_code = 409, detail = str(e))
         logger.error(f"Error exporting GGUF model: {e}", exc_info = True)
         raise HTTPException(
@@ -439,7 +474,9 @@ async def export_gguf(
 
 @router.post("/export/lora", response_model = ExportOperationResponse)
 async def export_lora_adapter(
-    request: ExportLoRAAdapterRequest, current_subject: str = Depends(get_current_subject)
+    request: ExportLoRAAdapterRequest,
+    current_subject: str = Depends(get_current_subject),
+    allow_ambient: bool = Depends(allow_ambient_hf_token),
 ):
     """Export only the LoRA adapter (if the loaded model is PEFT).
 
@@ -453,7 +490,11 @@ async def export_lora_adapter(
             save_directory = request.save_directory,
             push_to_hub = request.push_to_hub,
             repo_id = request.repo_id,
-            hf_token = request.hf_token,
+            hf_token = _resolve_export_hf_token(
+                request.hf_token,
+                push_to_hub = request.push_to_hub,
+                allow_ambient = allow_ambient,
+            ),
             private = request.private,
             gguf = request.gguf,
             gguf_outtype = request.gguf_outtype,
@@ -473,7 +514,6 @@ async def export_lora_adapter(
         from utils.transformers_version import SidecarSwapInProgress
 
         if isinstance(e, SidecarSwapInProgress):
-            # Expected loss of the race against a sidecar install: retryable 409.
             raise HTTPException(status_code = 409, detail = str(e))
         logger.error(f"Error exporting LoRA adapter: {e}", exc_info = True)
         raise HTTPException(
@@ -482,17 +522,9 @@ async def export_lora_adapter(
         )
 
 
-# Live export log stream (Server-Sent Events).
-#
-# The export worker's stdout/stderr is piped to the orchestrator as log
-# entries (core/export/worker.py, orchestrator.py); this endpoint streams
-# them to the browser for a live terminal panel during export operations.
-#
-# Shape follows routes/training.py::stream_training_progress: each event
-# carries id/event/data, the stream starts with a `retry:` directive, and
-# `Last-Event-ID` is honored on reconnect.
-
-
+# Live export log SSE. Same shape as stream_training_progress: id/event/data, a leading `retry:`, and
+# Last-Event-ID honoured on reconnect. Worker stdout/stderr reaches the orchestrator as log entries
+# (core/export/worker.py, orchestrator.py); shape follows routes/training.py.
 def _format_sse(
     data: str,
     event: str,
@@ -509,7 +541,9 @@ def _format_sse(
     return "\n".join(lines)
 
 
-@router.get("/logs/stream")
+# POST too: quick tunnels hold a streamed GET until it closes. The hidden GET keeps old clients.
+@router.post("/logs/stream")
+@router.get("/logs/stream", include_in_schema = False)
 async def stream_export_logs(
     request: Request,
     since: Optional[int] = Query(
@@ -534,9 +568,8 @@ async def stream_export_logs(
     """
     backend = get_export_backend()
 
-    # Starting cursor: explicit `since` wins, then Last-Event-ID on reconnect,
-    # else the run-start snapshot so the client sees every line since the run
-    # began even if the SSE connection opened after the export-kickoff POST.
+    # Starting cursor: explicit `since` wins, then Last-Event-ID on reconnect, else the run-start snapshot so the
+    # client sees every line since the run began even if the SSE connection opened after the export-kickoff POST.
     last_event_id = request.headers.get("last-event-id")
     if since is None and last_event_id is not None:
         try:
